@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"github.com/jc-lab/p2p-forwarder/forwarder"
 	"github.com/jc-lab/p2p-forwarder/pkg/p2p"
+	"github.com/libp2p/go-libp2p/core"
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -16,6 +17,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -78,7 +80,7 @@ func main() {
 
 	clientFlagSet := flag.NewFlagSet("client", flag.ExitOnError)
 	clientFlagSet.IntVar(&clientFlags.ProxyPort, "proxy-port", 0, "socks proxy server listen port")
-	clientFlagSet.Var(&commonFlags.ForwardPorts, "p", "forward ports (-p PORT or -p REMOTE_PORT:LOCAL_PORT)")
+	clientFlagSet.Var(&commonFlags.ForwardPorts, "p", "forward ports (-p PORT or -p LOCAL_PORT:REMOTE_PORT)")
 	clientFlagSet.StringVar(&clientFlags.DestPeerId, "d", "", "destination peer id")
 	clientFlagSet.BoolVar(&clientFlags.Ping, "ping", false, "ping test")
 	clientFlagSet.BoolVar(&clientFlags.WithPing, "with-ping", false, "ping test")
@@ -163,6 +165,18 @@ func serverApp(ctx context.Context, flags *ServerFlags) {
 		})
 	}
 
+	for _, text := range flags.ForwardPorts {
+		port, err := strconv.Atoi(text)
+		if err != nil {
+			log.Panicf("parse port(%s) failed: %+v", text, err)
+		}
+		protocolId := core.ProtocolID(forwarder.TcpProtocol + fmt.Sprintf("/%d", port))
+		log.Printf("Listen protocol id: %s", protocolId)
+		node.Host.SetStreamHandler(protocolId, func(stream network.Stream) {
+			forwarder.HandleTcpServer(port, stream)
+		})
+	}
+
 	select {}
 }
 
@@ -231,6 +245,47 @@ func clientApp(ctx context.Context, flags *ClientFlags) {
 		go func() {
 			for {
 				doPing(ctx, node, destPeerAddr.ID)
+			}
+		}()
+	}
+
+	for _, text := range flags.ForwardPorts {
+		tokens := strings.Split(text, ":")
+		var err error
+		var localPort int
+		var peerPort int
+		switch len(tokens) {
+		case 1:
+			peerPort, err = strconv.Atoi(text)
+			if err != nil {
+				log.Panicf("port[%s] parse failed: %+v", text, err)
+			}
+			localPort = peerPort
+		case 2:
+			localPort, err = strconv.Atoi(tokens[0])
+			if err != nil {
+				log.Panicf("port[%s] parse failed: %+v", tokens[0], err)
+			}
+			peerPort, err = strconv.Atoi(tokens[1])
+			if err != nil {
+				log.Panicf("port[%s] parse failed: %+v", tokens[1], err)
+			}
+		default:
+			log.Panicf("port[%s] parse failed: invalid format", text)
+		}
+		localAddr := fmt.Sprintf("127.0.0.1:%d", localPort)
+		listener, err := net.Listen("tcp", localAddr)
+		if err != nil {
+			log.Panicf("local port [%s] listen failed: %+v", localAddr, err)
+		}
+		go func() {
+			for {
+				conn, err := listener.Accept()
+				if err != nil {
+					log.Printf("local port [%s] accept failed: %+v", localAddr, err)
+					break
+				}
+				forwarder.HandleTcp(ctx, node, destPeerAddr.ID, conn, peerPort)
 			}
 		}()
 	}
